@@ -1,0 +1,82 @@
+name: reusable-release
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v1.2.3)"
+        required: false
+        type: string
+    secrets:
+      GPG_PRIVATE_KEY:
+        required: false
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Setup deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y make zsh dpkg-dev dpkg-sig jq curl gpg
+      - name: Import GPG key (optional)
+        if: ${{ secrets.GPG_PRIVATE_KEY !=  }}
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --batch --import
+          gpg --list-secret-keys || true
+      - name: Build .deb
+        run: |
+          set -e
+          VER="${{ inputs.tag || github.ref_name }}"; VER="${VER#v}"
+          echo "Building version $VER"
+          make clean || true
+          make deb DEB_VERSION="$VER"
+          ls -lh dist
+      - name: Sign .deb (optional)
+        run: |
+          set -e
+          KEYID=$(gpg --list-secret-keys --keyid-format=long | awk '/^sec/{print $2}' | sed 's|.*/||' | head -n1 || true)
+          for DEB in dist/*.deb; do
+            [ -e "$DEB" ] || continue
+            if command -v dpkg-sig >/dev/null 2>&1 && [ -n "$KEYID" ]; then
+              dpkg-sig --sign builder -k "$KEYID" "$DEB" || echo "::warning::dpkg-sig failed, leaving unsigned"
+            else
+              echo "::notice::No signing key/tool; skipping"
+            fi
+          done
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS.txt
+          gpg --clearsign -o SHA256SUMS.txt.minisig SHA256SUMS.txt || true
+          ls -lh
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: |
+            dist/*.deb
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.minisig
+          generate_release_notes: true
+      - name: Ensure launch_post.md exists (fallback to README)
+        run: |
+          if [ ! -f launch_post.md ]; then
+            echo "::notice::launch_post.md missing — creating from README.md head"
+            if [ -f README.md ]; then
+              { echo "# ${{ github.event.repository.name }} ${{ inputs.tag || github.ref_name }}"; echo; sed -n '1,40p' README.md; } > launch_post.md
+            else
+              echo "Release notes" > launch_post.md
+            fi
+          fi
+      - name: Update GitHub Release notes from launch_post.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          TAG="${{ inputs.tag || github.ref_name }}"
+          gh release view "$TAG" >/dev/null 2>&1 \
+            && gh release edit "$TAG" --title "${{ github.event.repository.name }} $TAG" --notes-file launch_post.md \
+            || gh release create "$TAG" --title "${{ github.event.repository.name }} $TAG" --notes-file launch_post.md
